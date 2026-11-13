@@ -1,0 +1,19 @@
+# Personal Claude Code instructions
+CLAUDE.local.md
+.claude/settings.local.json
+
+# Go build output
+/bin/
+*.test
+*.out
+coverage.*
+
+# Local secrets and env
+.env
+*.env
+kubeconfig*
+
+# Editors and OS
+.idea/
+.vscode/
+.DS_Store

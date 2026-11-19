@@ -1,0 +1,15 @@
+version: "2"
+
+linters:
+  enable:
+    - bodyclose   # HTTP response bodies are closed
+    - errorlint   # errors are compared with errors.Is / errors.As
+    - gosec       # common security mistakes
+    - misspell    # spelling in comments and strings
+    - revive      # Go style (exported names have doc comments, etc.)
+    - unconvert   # unnecessary type conversions
+
+formatters:
+  enable:
+    - gofmt
+    - goimports

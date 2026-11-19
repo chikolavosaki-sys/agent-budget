@@ -30,7 +30,8 @@ One buggy agent stuck in a loop can burn a whole month's budget overnight — an
 - ✅ Reads `usage.prompt_tokens` / `usage.completion_tokens` from each response and logs them
 - ✅ The agent gets the **exact same bytes** back — the proxy is invisible
 - ✅ Never logs prompts, answers or API keys (there is a test that checks this)
-- ✅ Handles gzip, upstream errors (502), streaming pass-through, and graceful shutdown
+- ✅ **Streaming** (`"stream": true`): words reach the agent live, and the tokens are still counted
+- ✅ Handles gzip, upstream errors (502), and graceful shutdown
 - ✅ **Per-team token budgets**: agents say their team in the `X-Budget-Team` header; over budget → `429`, no budget → `403` (fail closed)
 - ✅ **Live usage** at `GET /budgets`
 - ✅ Thread-safe counters (mutex), proven with Go's race detector and a concurrency test
@@ -163,6 +164,7 @@ agent-budget/
 │   ├── proxy/
 │   │   ├── proxy.go        # budget gate, forward request, read usage
 │   │   ├── usage.go        # parse "usage" from the response JSON
+│   │   ├── stream.go       # include_usage for streams + reader that counts SSE
 │   │   └── *_test.go       # tests with a fake provider (incl. concurrency)
 │   └── meter/
 │       ├── meter.go        # per-team counters behind a mutex
@@ -201,7 +203,7 @@ Details: [ROADMAP.md](ROADMAP.md).
 
 ## ⚠️ Known limits
 
-- **Streaming** answers (`"stream": true`) are passed through but **not counted** yet — so today a team could avoid its budget by streaming. Fixing this is [IDEA-1](research/IDEAS.md).
+- A stream that **breaks before its last chunk** is not counted (the usage arrives only at the end).
 - **Soft limit:** the check happens *before* a request and tokens are added *after*, so a team can go a little over (in the demo: 66 of 50). See [Architecture → soft limit](docs/ARCHITECTURE.md#why-the-limit-is-soft).
 - Counters live **in memory**: restarting the proxy resets them (durable counters are M5).
 - The team header is **trusted** — any agent can claim any team. Real identity comes in M2.

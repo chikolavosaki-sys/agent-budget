@@ -45,7 +45,7 @@ Verify each one's current status before relying on it. Remove an entry once it h
 - Impact / Effort / Learning (1–5 each): 5 / 3 / 4
 - Already solved elsewhere?: yes — LLM gateways do this; we need it for our own counters anyway.
 - Concept learned: streaming parsers, io.Reader wrapping, backpressure
-- Status: new — **priority**: with M1 enforcement on, streaming requests bypass the budget.
+- Status: done (2026-11-19, D-006) — `internal/proxy/stream.go`
 
 ## IDEA-2: Hard limits with token reservation
 - Inspired by: M1 soft-limit overshoot (D-005); the same "authorize then capture" pattern card payments use.

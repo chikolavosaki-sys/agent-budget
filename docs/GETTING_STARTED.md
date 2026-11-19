@@ -142,6 +142,28 @@ watch -n1 curl -s localhost:8080/budgets
 ]
 ```
 
+## Streaming
+
+Add `"stream": true` and use `curl -N` (no buffering) to watch the words arrive one by one:
+
+```bash
+curl -sN localhost:8080/v1/chat/completions \
+  -H 'X-Budget-Team: team-a' \
+  -d '{"model":"demo","stream":true,"messages":[{"role":"user","content":"Hello there!"}]}'
+```
+
+```text
+data: {"choices":[{"delta":{"content":"Hello "},"index":0}], …}
+data: {"choices":[{"delta":{"content":"from "},"index":0}], …}
+…
+data: {"choices":[],"usage":{"completion_tokens":11,"prompt_tokens":3,"total_tokens":14}, …}
+data: [DONE]
+```
+
+Streams are counted against the budget like any other request. To do that, the proxy turns on
+`stream_options.include_usage` in your request, so you will see **one extra chunk** with an empty
+`choices` array and the `usage` just before `[DONE]`. Agent SDKs that follow the OpenAI format handle it.
+
 ## JSON logs
 
 For log tools (Loki, Elasticsearch, `jq`):
@@ -164,7 +186,7 @@ LOG_FORMAT=json UPSTREAM_URL=http://localhost:9090 ./bin/proxy
 | `request blocked` | WARN | Team over budget (429) or without budget (403); provider not called |
 | `llm request failed upstream` | WARN | Provider returned a non-200 status (passed back to the agent as-is) |
 | `llm request: could not read token usage` | WARN | 200 OK but no readable `usage` in the body |
-| `streaming response: tokens not counted` | WARN | `"stream": true` — passed through, not counted (M0 limit) |
+| `stream ended without usage: tokens not counted` | WARN | A stream finished (or broke) without a usage chunk |
 | `response too large: tokens not counted` | WARN | Body over 10 MiB — passed through, not counted |
 | `upstream unreachable` | ERROR | Provider is down; agent receives `502 Bad Gateway` |
 
@@ -176,4 +198,7 @@ LOG_FORMAT=json UPSTREAM_URL=http://localhost:9090 ./bin/proxy
 | `bind: address already in use` | Something else uses the port. Try `LISTEN_ADDR=:8081`. |
 | `UPSTREAM_URL must look like http://host:port` | Add the scheme: `http://localhost:9090`, not `localhost:9090`. |
 | Every request gets `403 no_budget` | The team (or `default`) is missing from `BUDGETS`. Add it, or send `X-Budget-Team`. |
+| `413 request_too_large` | Request body over 32 MiB. |
+| `400 invalid_request` about `stream_options` | `stream_options` must be a JSON object, e.g. `{"include_usage":true}`. |
+| Provider rejects `stream_options` | Some older OpenAI-compatible servers do not know this field. Use a newer version, or don't stream. |
 | `GET /budgets` returns 404 `watch-only mode` | `BUDGETS` is empty — there are no budgets to show. |

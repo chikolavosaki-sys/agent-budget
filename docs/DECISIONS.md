@@ -13,6 +13,13 @@ Format:
 - Status: accepted | superseded by D-<n>
 ```
 
+## D-006: Count streaming responses by turning on include_usage (2026-11-19)
+- Context: with M1 enforcement, `"stream": true` requests were not counted, so a team could bypass its budget by streaming.
+- Options considered: block streaming when budgets are on / estimate tokens from the streamed text / ask the provider for usage with `stream_options.include_usage` and read the final chunk.
+- Decision: the proxy sets `stream_options.include_usage = true` on streamed requests and wraps the SSE response in a reader that passes bytes through immediately and records the usage chunk at the end. Every JSON-object request body is re-encoded so the provider sees exactly what the proxy inspected. Request bodies are capped at 32 MiB (`413`).
+- Why: exact provider numbers, no added latency, agents keep streaming. Trade-offs we accept: the agent receives one extra chunk it did not ask for (empty `choices`, per the OpenAI spec: https://github.com/openai/openai-openapi); providers that reject `stream_options` will fail streamed requests; a stream that breaks before the usage chunk is not counted (logged as WARN); key order of the request JSON may change.
+- Status: accepted
+
 ## D-005: M1 budget enforcement — team header, in-memory soft limit, fail closed (2026-11-19)
 - Context: M1 must block a team that has used its token budget, before M2 (real agent identity) and M5 (durable storage) exist.
 - Options considered:

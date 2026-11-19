@@ -46,6 +46,18 @@ Every term used in this project, in plain words with an everyday analogy. Useful
 **`io.Reader` / stream** — Data you read piece by piece; once read, it's gone.
 *Analogy:* water through a pipe — that's why we collect the body in a bucket (`[]byte`) and pour it again.
 
+**Wrapping a reader (decorator)** — A type that holds another `io.Reader` and adds behaviour while passing the data along. Our `usageStreamReader` wraps the provider's stream and *peeks* at every line without slowing it down.
+*Analogy:* a ticket checker standing at the train door — passengers keep flowing; he just glances at each ticket.
+
+**Flush** — Push data that is waiting in a buffer out to the network *now*. For streams, every piece must be flushed or the agent sees nothing until the end.
+
+**Parser differential** — Two programs read the same input differently (e.g. `{"stream":false,"stream":true}`: one takes the first key, one the last). An attacker can use the gap. We avoid it by re-encoding the request, so the provider receives exactly what we checked.
+*Analogy:* a cheque where the amount in words and in digits differ — the bank and you may read different amounts.
+
+**`sync.Once`** — Runs a function at most one time, even if called from many places. Used so a stream is charged exactly once.
+
+**Mutation testing** — Breaking the code on purpose to check that a test notices. A test that still passes on broken code is not testing anything.
+
 **`httptest.Server`** — A real HTTP server started inside a test, on a random port. Lets us test with a *fake* LLM.
 *Analogy:* a mock exam before the real one.
 

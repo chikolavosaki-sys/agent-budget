@@ -75,6 +75,13 @@ Blocking here, **before** forwarding, is the whole point: a blocked request cost
 
 `ServeHTTP` then puts a small `requestInfo{team, start}` into the request's **context** — a bag of values that travels with the request — so the response side knows which team to charge and how long the LLM took.
 
+### 3c. Prepare the body
+
+`prepareBody` reads the whole request body (max 32 MiB, else `413`) and calls `prepareRequest` (`internal/proxy/stream.go`):
+
+- If the body is a JSON object, it is **re-encoded**, so the provider receives exactly what we inspected. (Example attack it stops: `{"stream":false,"stream":true}` — if we read the last key but the provider read the first, a stream could slip through uncounted. This class of bug is called a *parser differential*.)
+- If `"stream": true`, it sets `stream_options.include_usage = true`. Without this, the provider sends **no** usage in a stream and we could not count it.
+
 ### 4. Rewrite and forward
 
 Go's standard library `httputil.ReverseProxy` does the forwarding. Our `Rewrite` function:
@@ -105,7 +112,7 @@ Field names come from the `CompletionUsage` schema in the
 ```mermaid
 flowchart TD
     R["Response arrives"] --> S{"Content-Type is<br/>text/event-stream?"}
-    S -- yes --> W1["WARN: streaming, not counted<br/>pass through"]
+    S -- yes --> W1["Wrap body in usageStreamReader<br/>(see Streaming below)"]
     S -- no --> B["Read body into memory<br/>(max 10 MiB)"]
     B --> T{"Bigger than 10 MiB?"}
     T -- yes --> W2["WARN: too large<br/>glue bytes back, pass through"]
@@ -120,6 +127,47 @@ flowchart TD
 Why "put the same bytes back"? An HTTP body is a **stream** — like water through a pipe, once you read it, it's gone. We read it all into a byte slice (`[]byte`) in RAM, look inside, then hand the agent a fresh reader over the same bytes.
 
 `ParseUsage` (`internal/proxy/usage.go`) decodes **only** `model` and `usage`. The Go struct simply has no field for `choices`, so the answer text is never even stored in a variable we use — and never logged.
+
+### 6b. Streaming answers (Server-Sent Events)
+
+With `"stream": true`, the answer arrives in pieces over a few seconds:
+
+```text
+data: {"choices":[{"delta":{"content":"Hello "}}],"usage":null}
+
+data: {"choices":[{"delta":{"content":"world"}}],"usage":null}
+
+data: {"choices":[],"usage":{"prompt_tokens":11,"completion_tokens":11,"total_tokens":22}}
+
+data: [DONE]
+```
+
+Per the [OpenAI spec](https://github.com/openai/openai-openapi) (`stream_options.include_usage`), every chunk has `"usage": null` **except one extra chunk just before `[DONE]`**, which holds the usage for the whole request.
+
+We cannot read the whole stream first — the agent would wait seconds for the first word. Instead `recordUsage` swaps the body for a **`usageStreamReader`** that *peeks while passing through*:
+
+```mermaid
+sequenceDiagram
+    participant LLM as LLM provider
+    participant R as usageStreamReader
+    participant RP as ReverseProxy
+    participant A as Agent
+    loop every piece
+        LLM->>R: bytes
+        R->>R: split into lines, look for "usage"
+        R->>RP: same bytes, immediately
+        RP->>A: flush
+    end
+    LLM->>R: end of stream (EOF)
+    R->>R: onDone(last usage) → Record(team, tokens)
+```
+
+Details that matter:
+
+- **Lines can be cut in half.** One `Read` may end in the middle of a line. The unfinished part waits in `pending` until its `\n` arrives. A test reads the stream **one byte at a time** to prove this works.
+- **Memory is bounded.** A line longer than 1 MiB is passed through but not inspected.
+- **Counted exactly once.** `onDone` runs on end-of-stream, on a read error or on `Close` — whichever comes first — guarded by `sync.Once`.
+- **Broken streams.** If the agent hangs up or the connection breaks before the usage chunk, nothing is counted and the proxy logs `WARN stream ended without usage`. The spec warns about this case too.
 
 ### 7. Back to the agent
 
@@ -184,7 +232,10 @@ This is the classic **check-then-act** problem. It is accepted for now (D-005). 
 | Provider is down | `502` with a JSON error | `ERROR upstream unreachable` |
 | Provider returns 429 / 500 | the same status and body | `WARN failed upstream` |
 | Agent disconnects mid-request | — | nothing (not an error) |
-| Streaming answer | the stream, unchanged | `WARN tokens not counted` |
+| Streaming answer | the stream, live and unchanged | `INFO llm request stream=true …` |
+| Stream breaks before the usage chunk | whatever arrived | `WARN stream ended without usage` |
+| Request body > 32 MiB | `413` | — |
+| `stream_options` is not an object | `400` | — |
 | Team over budget | `429` `budget_exceeded` | `WARN request blocked` |
 | Team has no budget | `403` `no_budget` | `WARN request blocked` |
 
@@ -207,7 +258,12 @@ flowchart LR
 | `TestProxyForwardsAndLogsUsage` | body unchanged, path + auth forwarded, tokens logged, **no secrets in logs** |
 | `TestProxyHandlesGzipFromProvider` | tokens still counted when the provider gzips |
 | `TestProxyUpstreamError` | a 429 from the provider passes through |
-| `TestProxyStreamingIsPassedThrough` | SSE stream unchanged, warning logged |
+| `TestProxyStreamingIsPassedThrough` | stream without usage passes through, warning logged |
+| `TestProxyStreamingIsLiveAndCounted` | provider got `include_usage`; first chunk reaches the agent **before** the provider sends the rest; tokens charged |
+| `TestProxyStreamingCannotBypassBudget` | 200, 200, then 429 with streams only |
+| `TestProxyRejectsBadRequests` | 400 and 413; provider never called |
+| `TestPrepareRequest` (table) | include_usage added, other options kept, duplicate keys, non-JSON untouched |
+| `TestUsageStreamReader` (table) | one-byte reads, CRLF, no usage, 1 MiB+ line, no trailing newline; `onDone` exactly once |
 | `TestProxyUpstreamDown` | 502 returned, no secrets logged |
 | `TestParseUsage` (table) | normal, zero tokens, missing usage, broken JSON, empty body |
 | `TestBudgetBlocksWhenOver` | 200, 200, then 429; the blocked call never reaches the provider |
@@ -219,3 +275,5 @@ flowchart LR
 | `TestConcurrentRecord` | 100 goroutines × 1000 updates, no lost updates |
 
 All tests run with Go's **race detector** (`go test -race`).
+
+**Testing the tests.** For the two most important tests we checked that they fail when the code is broken on purpose (*mutation testing*): removing the meter's mutex makes `TestConcurrentRecord` report data races, and buffering the whole stream makes `TestProxyStreamingIsLiveAndCounted` fail with "the proxy is buffering the stream".

@@ -17,9 +17,13 @@ import (
 	"github.com/chikolavosaki-sys/agent-budget/internal/meter"
 )
 
-// maxBodyBytes is the largest response body we read into memory to count
-// tokens. Bigger bodies are still forwarded, just not counted.
+// maxBodyBytes is the largest non-streaming response body we read into memory
+// to count tokens. Bigger bodies are still forwarded, just not counted.
 const maxBodyBytes = 10 << 20 // 10 MiB
+
+// maxRequestBytes is the largest request body we accept. We must read the
+// whole request to see whether it asks for streaming.
+const maxRequestBytes = 32 << 20 // 32 MiB
 
 // TeamHeader is the request header an agent uses to say which team it belongs
 // to. The proxy removes it before forwarding, so the provider never sees it.
@@ -71,8 +75,9 @@ func New(upstream *url.URL, logger *slog.Logger, budget Budget) *Proxy {
 // requestInfo travels with each request in its context, from ServeHTTP to
 // recordUsage.
 type requestInfo struct {
-	team  string
-	start time.Time
+	team   string
+	start  time.Time
+	stream bool
 }
 
 type requestInfoKey struct{}
@@ -92,9 +97,53 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	info := requestInfo{team: team, start: time.Now()}
+	stream, ok := p.prepareBody(w, r)
+	if !ok {
+		return
+	}
+
+	info := requestInfo{team: team, start: time.Now(), stream: stream}
 	ctx := context.WithValue(r.Context(), requestInfoKey{}, info)
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// prepareBody reads the request body, lets prepareRequest adjust it, and puts
+// the result back on r. It returns ok=false after writing an error response.
+func (p *Proxy) prepareBody(w http.ResponseWriter, r *http.Request) (stream, ok bool) {
+	body, err := io.ReadAll(io.LimitReader(r.Body, maxRequestBytes+1))
+	_ = r.Body.Close()
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "bad_request", "could not read request body")
+		return false, false
+	}
+	if len(body) > maxRequestBytes {
+		writeError(w, http.StatusRequestEntityTooLarge, "request_too_large",
+			fmt.Sprintf("request body is larger than %d bytes", maxRequestBytes))
+		return false, false
+	}
+	if len(body) == 0 {
+		r.Body, r.ContentLength = http.NoBody, 0
+		return false, true
+	}
+
+	body, stream, err = prepareRequest(body)
+	if err != nil {
+		writeError(w, http.StatusBadRequest, "invalid_request", err.Error())
+		return false, false
+	}
+	r.Body = io.NopCloser(bytes.NewReader(body))
+	r.ContentLength = int64(len(body))
+	r.Header.Del("Content-Length") // the transport sets it from r.ContentLength
+	return stream, true
+}
+
+// writeError sends an error in the OpenAI error shape, which agent SDKs understand.
+func writeError(w http.ResponseWriter, status int, code, message string) {
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]string{"message": message, "type": code, "code": code},
+	})
 }
 
 // reject answers without contacting the provider: 429 if the team used up its
@@ -107,12 +156,7 @@ func (p *Proxy) reject(w http.ResponseWriter, r *http.Request, team string, err 
 	}
 	p.logger.WarnContext(r.Context(), "request blocked",
 		slog.String("team", team), slog.Int("status", status), slog.String("reason", err.Error()))
-
-	w.Header().Set("Content-Type", "application/json")
-	w.WriteHeader(status)
-	_ = json.NewEncoder(w).Encode(map[string]any{
-		"error": map[string]string{"message": err.Error(), "type": code, "code": code},
-	})
+	writeError(w, status, code, err.Error())
 }
 
 // recordUsage runs after the provider answers and before the answer goes back
@@ -120,23 +164,29 @@ func (p *Proxy) reject(w http.ResponseWriter, r *http.Request, team string, err 
 // bytes back so the agent sees no difference.
 func (p *Proxy) recordUsage(resp *http.Response) error {
 	ctx := resp.Request.Context()
+	info, _ := ctx.Value(requestInfoKey{}).(requestInfo)
 	attrs := []any{
 		slog.String("method", resp.Request.Method),
 		slog.String("path", resp.Request.URL.Path),
 		slog.Int("status", resp.StatusCode),
-	}
-	info, _ := ctx.Value(requestInfoKey{}).(requestInfo)
-	attrs = append(attrs, slog.String("team", info.team))
-	if !info.start.IsZero() {
-		attrs = append(attrs, slog.Int64("duration_ms", time.Since(info.start).Milliseconds()))
+		slog.String("team", info.team),
+		slog.Bool("stream", info.stream),
 	}
 
 	// Streaming answers (Server-Sent Events) arrive in many small pieces.
-	// M0 does not count them yet; we pass them straight through.
+	// We pass every byte on immediately and count the usage chunk at the end.
 	if mediaType, _, _ := mime.ParseMediaType(resp.Header.Get("Content-Type")); mediaType == "text/event-stream" {
-		p.logger.WarnContext(ctx, "streaming response: tokens not counted", attrs...)
+		resp.Body = newUsageStreamReader(resp.Body, func(u Usage, found bool) {
+			attrs = append(attrs, durationAttr(info))
+			if !found {
+				p.logger.WarnContext(ctx, "stream ended without usage: tokens not counted", attrs...)
+				return
+			}
+			p.account(ctx, info, u, attrs)
+		})
 		return nil
 	}
+	attrs = append(attrs, durationAttr(info))
 
 	orig := resp.Body
 	body, err := io.ReadAll(io.LimitReader(orig, maxBodyBytes+1))
@@ -164,16 +214,28 @@ func (p *Proxy) recordUsage(resp *http.Response) error {
 		p.logger.WarnContext(ctx, "llm request: could not read token usage", attrs...)
 		return nil
 	}
+	p.account(ctx, info, usage, attrs)
+	return nil
+}
+
+// account charges the tokens to the team and writes the "llm request" log line.
+func (p *Proxy) account(ctx context.Context, info requestInfo, u Usage, attrs []any) {
 	if p.budget != nil {
-		p.budget.Record(info.team, int64(usage.InputTokens)+int64(usage.OutputTokens))
+		p.budget.Record(info.team, int64(u.InputTokens)+int64(u.OutputTokens))
 	}
 	attrs = append(attrs,
-		slog.String("model", usage.Model),
-		slog.Int("input_tokens", usage.InputTokens),
-		slog.Int("output_tokens", usage.OutputTokens),
+		slog.String("model", u.Model),
+		slog.Int("input_tokens", u.InputTokens),
+		slog.Int("output_tokens", u.OutputTokens),
 	)
 	p.logger.InfoContext(ctx, "llm request", attrs...)
-	return nil
+}
+
+func durationAttr(info requestInfo) slog.Attr {
+	if info.start.IsZero() {
+		return slog.Attr{}
+	}
+	return slog.Int64("duration_ms", time.Since(info.start).Milliseconds())
 }
 
 // handleError answers 502 Bad Gateway when the provider cannot be reached.

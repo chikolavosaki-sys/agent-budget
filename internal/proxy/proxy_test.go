@@ -151,8 +151,8 @@ func TestProxyStreamingIsPassedThrough(t *testing.T) {
 	if got != stream {
 		t.Errorf("stream body changed: %q", got)
 	}
-	if !strings.Contains(logs.String(), "tokens not counted") {
-		t.Errorf("expected a 'tokens not counted' log\nlog: %s", logs.String())
+	if !strings.Contains(logs.String(), "stream ended without usage") {
+		t.Errorf("expected a 'stream ended without usage' log\nlog: %s", logs.String())
 	}
 }
 

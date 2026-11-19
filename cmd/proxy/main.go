@@ -6,10 +6,13 @@
 //	LISTEN_ADDR   address to listen on        (default ":8080")
 //	UPSTREAM_URL  LLM provider base URL       (default "http://localhost:11434", Ollama)
 //	LOG_FORMAT    "text" or "json"            (default "text")
+//	BUDGETS       token limit per team, e.g. "default=1000,team-a=500"
+//	              (empty = watch-only: count and log, never block)
 package main
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -21,6 +24,7 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/chikolavosaki-sys/agent-budget/internal/meter"
 	"github.com/chikolavosaki-sys/agent-budget/internal/proxy"
 )
 
@@ -40,11 +44,30 @@ func run() error {
 		return err
 	}
 
+	limits, err := meter.ParseBudgets(os.Getenv("BUDGETS"))
+	if err != nil {
+		return fmt.Errorf("parse BUDGETS: %w", err)
+	}
+
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 	})
-	mux.Handle("/", proxy.New(upstream, logger))
+
+	if len(limits) == 0 {
+		logger.Warn("BUDGETS is empty: watch-only mode, no request will be blocked")
+		mux.HandleFunc("GET /budgets", func(w http.ResponseWriter, _ *http.Request) {
+			w.Header().Set("Content-Type", "application/json")
+			w.WriteHeader(http.StatusNotFound)
+			_, _ = io.WriteString(w, `{"error":{"message":"watch-only mode: BUDGETS is empty"}}`+"\n")
+		})
+		mux.Handle("/", proxy.New(upstream, logger, nil))
+	} else {
+		m := meter.New(limits)
+		logger.Info("budgets loaded", "teams", len(limits))
+		mux.Handle("GET /budgets", budgetsHandler(m))
+		mux.Handle("/", proxy.New(upstream, logger, m))
+	}
 
 	srv := &http.Server{
 		Addr:              listenAddr,
@@ -80,6 +103,16 @@ func run() error {
 		return fmt.Errorf("shutdown: %w", err)
 	}
 	return nil
+}
+
+// budgetsHandler shows every team's live usage as JSON.
+func budgetsHandler(m *meter.Meter) http.Handler {
+	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		w.Header().Set("Content-Type", "application/json")
+		enc := json.NewEncoder(w)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(m.Snapshot())
+	})
 }
 
 func parseUpstream(raw string) (*url.URL, error) {

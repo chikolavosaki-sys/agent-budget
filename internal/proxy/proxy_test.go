@@ -24,6 +24,12 @@ const (
 // It returns the proxy's URL and a buffer that collects the proxy's logs.
 func newTestProxy(t *testing.T, provider http.HandlerFunc) (string, *bytes.Buffer) {
 	t.Helper()
+	return newTestProxyWithBudget(t, provider, nil)
+}
+
+// newTestProxyWithBudget is newTestProxy with a budget gate (nil = watch-only).
+func newTestProxyWithBudget(t *testing.T, provider http.HandlerFunc, budget Budget) (string, *bytes.Buffer) {
+	t.Helper()
 	upstream := httptest.NewServer(provider)
 	t.Cleanup(upstream.Close)
 
@@ -34,7 +40,7 @@ func newTestProxy(t *testing.T, provider http.HandlerFunc) (string, *bytes.Buffe
 	logs := &bytes.Buffer{}
 	logger := slog.New(slog.NewJSONHandler(logs, nil))
 
-	front := httptest.NewServer(New(u, logger))
+	front := httptest.NewServer(New(u, logger, budget))
 	t.Cleanup(front.Close)
 	return front.URL, logs
 }
@@ -157,7 +163,7 @@ func TestProxyUpstreamDown(t *testing.T) {
 	dead.Close()
 
 	logs := &bytes.Buffer{}
-	front := httptest.NewServer(New(u, slog.New(slog.NewJSONHandler(logs, nil))))
+	front := httptest.NewServer(New(u, slog.New(slog.NewJSONHandler(logs, nil)), nil))
 	t.Cleanup(front.Close)
 
 	status, _ := postChat(t, front.URL, nil)

@@ -3,6 +3,7 @@ package proxy
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -12,23 +13,44 @@ import (
 	"net/http/httputil"
 	"net/url"
 	"time"
+
+	"github.com/chikolavosaki-sys/agent-budget/internal/meter"
 )
 
 // maxBodyBytes is the largest response body we read into memory to count
 // tokens. Bigger bodies are still forwarded, just not counted.
 const maxBodyBytes = 10 << 20 // 10 MiB
 
-// Proxy sits between an agent and an LLM provider. It forwards every request
-// unchanged and logs the token usage found in the response.
+// TeamHeader is the request header an agent uses to say which team it belongs
+// to. The proxy removes it before forwarding, so the provider never sees it.
+const TeamHeader = "X-Budget-Team"
+
+// DefaultTeam is used when a request has no TeamHeader.
+const DefaultTeam = "default"
+
+// Budget decides whether a team may send a request and records what it spent.
+// *meter.Meter implements it. Implementations must be safe for concurrent use.
+type Budget interface {
+	// Allow returns nil if the team may send a request. Otherwise it returns
+	// an error wrapping meter.ErrNoBudget or meter.ErrOverBudget.
+	Allow(team string) error
+	// Record adds the tokens a finished request used.
+	Record(team string, tokens int64)
+}
+
+// Proxy sits between an agent and an LLM provider. It checks the team's budget,
+// forwards the request unchanged, and counts the tokens in the response.
 type Proxy struct {
 	rp     *httputil.ReverseProxy
 	logger *slog.Logger
+	budget Budget // nil = watch-only: count and log, never block
 }
 
 // New returns a Proxy that sends all requests to upstream
 // (for example http://localhost:11434 or https://api.openai.com).
-func New(upstream *url.URL, logger *slog.Logger) *Proxy {
-	p := &Proxy{logger: logger}
+// If budget is nil, the proxy only logs usage and never blocks.
+func New(upstream *url.URL, logger *slog.Logger, budget Budget) *Proxy {
+	p := &Proxy{logger: logger, budget: budget}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			// Point the request at the provider: scheme, host and path prefix.
@@ -37,6 +59,8 @@ func New(upstream *url.URL, logger *slog.Logger) *Proxy {
 			// provider for gzip itself and unzips it for us, so we always get
 			// plain JSON to read tokens from.
 			r.Out.Header.Del("Accept-Encoding")
+			// The team is our business, not the provider's.
+			r.Out.Header.Del(TeamHeader)
 		},
 		ModifyResponse: p.recordUsage,
 		ErrorHandler:   p.handleError,
@@ -44,12 +68,51 @@ func New(upstream *url.URL, logger *slog.Logger) *Proxy {
 	return p
 }
 
-type startTimeKey struct{}
+// requestInfo travels with each request in its context, from ServeHTTP to
+// recordUsage.
+type requestInfo struct {
+	team  string
+	start time.Time
+}
 
-// ServeHTTP implements http.Handler.
+type requestInfoKey struct{}
+
+// ServeHTTP implements http.Handler. It is the "gate": budget check first,
+// then forward.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	ctx := context.WithValue(r.Context(), startTimeKey{}, time.Now())
+	team := r.Header.Get(TeamHeader)
+	if team == "" {
+		team = DefaultTeam
+	}
+
+	if p.budget != nil {
+		if err := p.budget.Allow(team); err != nil {
+			p.reject(w, r, team, err)
+			return
+		}
+	}
+
+	info := requestInfo{team: team, start: time.Now()}
+	ctx := context.WithValue(r.Context(), requestInfoKey{}, info)
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
+}
+
+// reject answers without contacting the provider: 429 if the team used up its
+// budget, 403 if it has none. The body uses the OpenAI error shape so agent
+// SDKs can show the message.
+func (p *Proxy) reject(w http.ResponseWriter, r *http.Request, team string, err error) {
+	status, code := http.StatusForbidden, "no_budget"
+	if errors.Is(err, meter.ErrOverBudget) {
+		status, code = http.StatusTooManyRequests, "budget_exceeded"
+	}
+	p.logger.WarnContext(r.Context(), "request blocked",
+		slog.String("team", team), slog.Int("status", status), slog.String("reason", err.Error()))
+
+	w.Header().Set("Content-Type", "application/json")
+	w.WriteHeader(status)
+	_ = json.NewEncoder(w).Encode(map[string]any{
+		"error": map[string]string{"message": err.Error(), "type": code, "code": code},
+	})
 }
 
 // recordUsage runs after the provider answers and before the answer goes back
@@ -62,8 +125,10 @@ func (p *Proxy) recordUsage(resp *http.Response) error {
 		slog.String("path", resp.Request.URL.Path),
 		slog.Int("status", resp.StatusCode),
 	}
-	if start, ok := ctx.Value(startTimeKey{}).(time.Time); ok {
-		attrs = append(attrs, slog.Int64("duration_ms", time.Since(start).Milliseconds()))
+	info, _ := ctx.Value(requestInfoKey{}).(requestInfo)
+	attrs = append(attrs, slog.String("team", info.team))
+	if !info.start.IsZero() {
+		attrs = append(attrs, slog.Int64("duration_ms", time.Since(info.start).Milliseconds()))
 	}
 
 	// Streaming answers (Server-Sent Events) arrive in many small pieces.
@@ -98,6 +163,9 @@ func (p *Proxy) recordUsage(resp *http.Response) error {
 		attrs = append(attrs, slog.String("error", err.Error()))
 		p.logger.WarnContext(ctx, "llm request: could not read token usage", attrs...)
 		return nil
+	}
+	if p.budget != nil {
+		p.budget.Record(info.team, int64(usage.InputTokens)+int64(usage.OutputTokens))
 	}
 	attrs = append(attrs,
 		slog.String("model", usage.Model),

@@ -2,6 +2,8 @@
 
 BIN_DIR := bin
 GOLANGCI_LINT ?= golangci-lint
+# Demo budgets for `make run-proxy`. Override: make run-proxy BUDGETS="default=500"
+BUDGETS ?= default=100,team-a=50
 
 .PHONY: help build test cover lint fmt run-fake run-proxy clean
 
@@ -28,8 +30,8 @@ fmt: ## Format all Go code
 run-fake: build ## Start the fake LLM on :9090
 	./$(BIN_DIR)/fakellm
 
-run-proxy: build ## Start the proxy on :8080 in front of the fake LLM
-	UPSTREAM_URL=http://localhost:9090 ./$(BIN_DIR)/proxy
+run-proxy: build ## Start the proxy on :8080 in front of the fake LLM, with demo budgets
+	UPSTREAM_URL=http://localhost:9090 BUDGETS="$(BUDGETS)" ./$(BIN_DIR)/proxy
 
 clean: ## Remove build output
 	rm -rf $(BIN_DIR) coverage.out

@@ -45,4 +45,14 @@ Verify each one's current status before relying on it. Remove an entry once it h
 - Impact / Effort / Learning (1–5 each): 5 / 3 / 4
 - Already solved elsewhere?: yes — LLM gateways do this; we need it for our own counters anyway.
 - Concept learned: streaming parsers, io.Reader wrapping, backpressure
+- Status: new — **priority**: with M1 enforcement on, streaming requests bypass the budget.
+
+## IDEA-2: Hard limits with token reservation
+- Inspired by: M1 soft-limit overshoot (D-005); the same "authorize then capture" pattern card payments use.
+- The idea in one line: before forwarding, reserve the request's worst case (`max_tokens` + estimated prompt tokens); after the answer, replace the reservation with the real count.
+- How it works there (plain words + analogy): a hotel blocks ₹5000 on your card at check-in, then charges the real bill at check-out and releases the rest.
+- How it would work here: `Allow` becomes `Reserve(team, n)` that fails if `used + reserved + n > limit`; `Record` becomes `Settle(team, reserved, actual)`. Needs a rule for requests without `max_tokens`.
+- Impact / Effort / Learning (1–5 each): 4 / 3 / 5
+- Already solved elsewhere?: partly — payment systems and some rate limiters; not per agent for LLM tokens.
+- Concept learned: check-then-act, reservations, two-phase accounting
 - Status: new

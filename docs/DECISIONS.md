@@ -13,6 +13,18 @@ Format:
 - Status: accepted | superseded by D-<n>
 ```
 
+## D-005: M1 budget enforcement — team header, in-memory soft limit, fail closed (2026-11-19)
+- Context: M1 must block a team that has used its token budget, before M2 (real agent identity) and M5 (durable storage) exist.
+- Options considered:
+  - Team identity: `X-Budget-Team` header / API key per team / Kubernetes service account. → **header** (M2 decides the real one).
+  - Limit type: soft (check before, count after) / hard (reserve `max_tokens` before, settle after). → **soft**.
+  - Unknown team: fail open (allow) / fail closed (block). → **fail closed, `403 no_budget`**.
+  - `BUDGETS` empty: refuse to start / watch-only. → **watch-only**, with a startup WARN.
+  - Storage: Go map + `sync.Mutex` / `sync.Map` / atomics per team. → **map + mutex**.
+- Decision: as marked above. Over budget → `429 budget_exceeded` in the OpenAI error shape.
+- Why: smallest design that blocks real overspending and is easy to reason about. Trade-offs we accept: overshoot up to (in-flight requests × tokens per request); any agent can claim any team; counters reset on restart; streaming requests are not counted (IDEA-1). Mutex chosen over `sync.Map` because `Allow` must read the limit and the usage together, consistently.
+- Status: accepted
+
 ## D-004: Pin `go 1.26` in go.mod and require golangci-lint ≥ 2.15 (2026-11-19)
 - Context: the dev machine has Go 1.27.4; golangci-lint 2.10.1 panics on Go 1.27 standard-library export data.
 - Options considered: downgrade Go / upgrade golangci-lint / skip lint.

@@ -2,14 +2,15 @@
 
 ## Next
 
-- [ ] Start M1: an in-memory per-team token counter, and HTTP 429 when a team is over its limit.
+- [ ] Start M2: decide how to identify the agent and team (header vs. virtual key vs. Kubernetes service account), record it in DECISIONS, add per-agent counters.
+- [ ] Soon: count streaming responses (IDEA-1) — today streaming bypasses the budget.
 
 ## Milestones
 
 Each milestone must work end to end, with tests, before the next one starts.
 
 - [x] **M0 — Hello proxy.** Go module, Makefile (`build`, `test`, `lint`), golangci-lint config. A proxy forwards one LLM request and logs `input_tokens` / `output_tokens` from the response. Unit test with a fake provider. *(done 2026-11-19 — also ships `fakellm` for demos and GitHub Actions CI)*
-- [ ] **M1 — Count and block.** In-memory per-team counter; return HTTP 429 when over the limit. Concurrency test with `-race`.
+- [x] **M1 — Count and block.** In-memory per-team counter; return HTTP 429 when over the limit. Concurrency test with `-race`. *(done 2026-11-19 — `X-Budget-Team` header, `BUDGETS` env, `GET /budgets`, 403 for teams without a budget; see D-005)*
 - [ ] **M2 — Know the agent.** Identify agent + team per request (header, virtual key, or Kubernetes service account — decide and record in DECISIONS). Per-agent counters.
 - [ ] **M3 — Budgets in Kubernetes.** `TokenBudget` CRD (`v1alpha1`) + controller on kind. Changing the YAML changes the live limit. envtest coverage.
 - [ ] **M4 — See it.** OTel GenAI traces into Jaeger, metrics into Prometheus, one Grafana dashboard: spend by team and by agent.

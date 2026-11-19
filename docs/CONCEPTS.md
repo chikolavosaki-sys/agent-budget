@@ -56,8 +56,32 @@ Every term used in this project, in plain words with an everyday analogy. Useful
 
 **Structured logging (`slog`)** — Logs as key=value pairs instead of free text, so machines can search them (`input_tokens=11`).
 
+**Fail closed vs. fail open** — When the system is unsure, *fail closed* says "no", *fail open* says "yes". We fail closed: a team with no budget gets `403`.
+*Analogy:* a door with an electronic lock — in a power cut, a bank vault stays locked (closed); a fire exit opens (open).
+
+**429 vs. 403** — `429 Too Many Requests`: "you're allowed, but you've used up your share — slow down". `403 Forbidden`: "you're not allowed at all".
+
 **Graceful shutdown** — On Ctrl+C, stop taking new work but finish current work before exiting.
 *Analogy:* the shop pulls down the shutter halfway — no new customers, but those inside finish shopping.
+
+**Data race** — Two goroutines touch the same memory at the same time, and at least one of them writes. The result depends on luck.
+*Analogy:* two people updating the same bank passbook at two counters — one deposit disappears.
+
+**Lost update** — The most common data-race symptom: two "read → add → write" steps interleave, and one addition is overwritten. See the table in [Architecture](ARCHITECTURE.md#the-meter-and-the-mutex).
+
+**Mutex (`sync.Mutex`)** — A lock: `Lock()` waits until no one else holds it, `Unlock()` lets the next one in. Code between them runs one goroutine at a time.
+*Analogy:* the single key to the hostel washroom — whoever has the key goes in; everyone else waits.
+
+**`defer`** — Runs a line when the function returns, however it returns. `defer m.mu.Unlock()` makes sure we never forget to unlock.
+*Analogy:* "switch off the lights when you leave" — written on the door, so it happens on every exit.
+
+**Check-then-act** — Checking a condition and acting on it as two separate steps; the world can change in between. Our budget check is check-then-act, which is why the limit is *soft*.
+*Analogy:* you check the cinema app — 1 seat left — but by the time you pay, someone else booked it.
+
+**Interface** — A Go type that lists methods, not data. Our proxy depends on a `Budget` interface (`Allow`, `Record`), not on the meter itself, so tests or a future Redis meter can plug in.
+*Analogy:* a phone charger port — any charger that fits the shape works.
+
+**Sentinel error / `errors.Is`** — A named error value (`ErrOverBudget`) that callers can test for, even after it has been wrapped with more detail via `fmt.Errorf("...: %w", err)`.
 
 **Linter (golangci-lint)** — A tool that reads code without running it and points out bugs and style problems.
 *Analogy:* a strict teacher checking your answer sheet before submission.

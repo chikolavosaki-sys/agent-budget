@@ -16,4 +16,4 @@ description: End-of-session routine — update roadmap, decisions and research l
    - What is next and roughly how long it will take.
    - Anything risky or unfinished.
 4. **Draft one public post** under 280 characters about what was learned today — specific, no hype, no secrets or keys, and nothing the user has not decided to share.
-5. Suggest a commit message in Conventional Commits format and remind the user to sign off with `git commit -s` if there are uncommitted changes.
+5. Suggest a commit message in Conventional Commits format if there are uncommitted changes.

@@ -37,4 +37,12 @@ Verify each one's current status before relying on it. Remove an entry once it h
 
 ## Ideas
 
-_None yet. Run `/research` to add the first one._
+## IDEA-1: Count tokens in streaming answers
+- Inspired by: M0 limitation; OpenAI-compatible APIs can send usage in the last stream chunk when `stream_options.include_usage` is set (Ollama lists it as supported: https://docs.ollama.com/api/openai-compatibility)
+- The idea in one line: read the SSE stream as it flows, find the final chunk that carries `usage`, and count it — without delaying the stream.
+- How it works there (plain words + analogy): the provider sends the answer word by word and, at the very end, a "bill" chunk with the token totals — like a waiter bringing the bill after the last dish.
+- How it would work here: wrap the response body in a reader that copies bytes to the agent immediately and scans each `data:` line for `usage`; optionally add `include_usage` to the request if the agent did not.
+- Impact / Effort / Learning (1–5 each): 5 / 3 / 4
+- Already solved elsewhere?: yes — LLM gateways do this; we need it for our own counters anyway.
+- Concept learned: streaming parsers, io.Reader wrapping, backpressure
+- Status: new

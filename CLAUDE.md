@@ -1,8 +1,10 @@
-# <PROJECT_NAME> — token budgets for AI agents on Kubernetes
+# agent-budget — token budgets for AI agents on Kubernetes
 
 A Kubernetes-native controller and proxy that **tracks and enforces token/cost budgets for AI agents** — per agent, per workflow and per team — **at request time**, and shows who spent what and why. First integration target: kagent.
 
 Personal working style and language rules live in `CLAUDE.local.md` (not committed).
+
+**This is a college project** (see D-003 in `docs/DECISIONS.md`). Keep code quality high, but skip CNCF-style process: no DCO sign-off, no mandatory design proposals, no community files.
 
 ## Scope
 
@@ -39,18 +41,18 @@ Create directories only when the first file for them is needed.
 
 ## Commands
 
-The Makefile is created in milestone M0. Keep these targets working:
+Keep these Makefile targets working:
 
 - `make build` — build all binaries
 - `make test` — unit tests with the race detector (`go test -race ./...`)
-- `make lint` — `golangci-lint run`
+- `make lint` — `golangci-lint run` (needs golangci-lint ≥ 2.15 with Go 1.27; override with `GOLANGCI_LINT=path`)
 - `make generate manifests` — regenerate CRD code and YAML after changing `api/`
 - `make kind-up` / `make kind-down` — local cluster
 - `make e2e` — end-to-end tests on kind
 
 Before saying a task is done: run `make lint test` and report the result. If a command fails, show the error; never claim success without running it.
 
-## Engineering standards (CNCF level)
+## Engineering standards
 
 **Go**
 - Go version pinned in `go.mod`; `gofmt` + `golangci-lint` clean.
@@ -68,16 +70,13 @@ Before saying a task is done: run `make lint test` and report the result. If a c
 
 **Security**
 - Never log prompts, completions, API keys or tokens. Provider keys come from Kubernetes Secrets or env vars, never from files in the repo.
-- Fail **closed** when the budget state is unknown, unless a budget explicitly says otherwise — document this choice in each proposal that touches enforcement.
+- Fail **closed** when the budget state is unknown, unless a budget explicitly says otherwise — record this choice in `docs/DECISIONS.md` when building enforcement (M1).
 
 **Changes and history**
 - One logical change per commit. Conventional Commits (`feat:`, `fix:`, `docs:`, `test:`, `refactor:`, `chore:`).
-- Sign off every commit for DCO: `git commit -s`.
-- Any change to the API, the enforcement path or storage needs a design proposal in `docs/proposals/` first (copy `0000-template.md`). Small fixes do not.
+- Big design changes (CRD, storage) can get a short write-up in `docs/proposals/` — optional.
 - Record every real decision in `docs/DECISIONS.md`.
 - Keep `README.md` and `docs/` in sync with behaviour.
-
-**Licensing and community** — Apache-2.0 license. Before the repo goes public, add `CONTRIBUTING.md`, `CODE_OF_CONDUCT.md` (CNCF Code of Conduct), `SECURITY.md` and GitHub Actions CI for lint + test + build.
 
 ## Working rules
 

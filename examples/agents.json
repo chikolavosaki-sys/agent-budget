@@ -1,0 +1,27 @@
+{
+  "teams": [
+    { "name": "payments", "budget": 100 },
+    { "name": "search",   "budget": 1000 }
+  ],
+  "agents": [
+    {
+      "name": "invoice-bot",
+      "team": "payments",
+      "owner": "payments-lead",
+      "budget": 50,
+      "key_sha256": "0349141ca7bd879f04280c5d3e1a33f7038973866bb2830d50b8b2ed48c4bc6e"
+    },
+    {
+      "name": "refund-bot",
+      "team": "payments",
+      "owner": "payments-lead",
+      "key_sha256": "0c898c368fc891e46cdf9138c99b9021148a0ab79af5ccf8ae7b702d9aa5aa44"
+    },
+    {
+      "name": "search-bot",
+      "team": "search",
+      "owner": "search-lead",
+      "key_sha256": "4e4df0e852f0cf61fc272ea6e659c95449b78c40c3e2f4f331732455620dd7b4"
+    }
+  ]
+}

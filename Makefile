@@ -2,10 +2,10 @@
 
 BIN_DIR := bin
 GOLANGCI_LINT ?= golangci-lint
-# Demo budgets for `make run-proxy`. Override: make run-proxy BUDGETS="default=500"
-BUDGETS ?= default=100,team-a=50
+# Agents file for `make run-proxy`. Override: make run-proxy AGENTS_FILE=my-agents.json
+AGENTS_FILE ?= examples/agents.json
 
-.PHONY: help build test cover lint fmt run-fake run-proxy clean
+.PHONY: help build test cover lint fmt run-fake run-proxy keygen clean
 
 help: ## Show this help
 	@grep -E '^[a-zA-Z_-]+:.*?## ' $(MAKEFILE_LIST) | \
@@ -30,8 +30,11 @@ fmt: ## Format all Go code
 run-fake: build ## Start the fake LLM on :9090
 	./$(BIN_DIR)/fakellm
 
-run-proxy: build ## Start the proxy on :8080 in front of the fake LLM, with demo budgets
-	UPSTREAM_URL=http://localhost:9090 BUDGETS="$(BUDGETS)" ./$(BIN_DIR)/proxy
+run-proxy: build ## Start the proxy on :8080 in front of the fake LLM, with the demo agents
+	UPSTREAM_URL=http://localhost:9090 AGENTS_FILE="$(AGENTS_FILE)" ./$(BIN_DIR)/proxy
+
+keygen: build ## Print a new virtual key and its hash for the agents file
+	./$(BIN_DIR)/proxy keygen
 
 clean: ## Remove build output
 	rm -rf $(BIN_DIR) coverage.out

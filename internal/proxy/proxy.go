@@ -12,8 +12,10 @@ import (
 	"net/http"
 	"net/http/httputil"
 	"net/url"
+	"strings"
 	"time"
 
+	"github.com/chikolavosaki-sys/agent-budget/internal/agents"
 	"github.com/chikolavosaki-sys/agent-budget/internal/meter"
 )
 
@@ -25,36 +27,59 @@ const maxBodyBytes = 10 << 20 // 10 MiB
 // whole request to see whether it asks for streaming.
 const maxRequestBytes = 32 << 20 // 32 MiB
 
-// TeamHeader is the request header an agent uses to say which team it belongs
-// to. The proxy removes it before forwarding, so the provider never sees it.
-const TeamHeader = "X-Budget-Team"
-
-// DefaultTeam is used when a request has no TeamHeader.
-const DefaultTeam = "default"
-
-// Budget decides whether a team may send a request and records what it spent.
-// *meter.Meter implements it. Implementations must be safe for concurrent use.
-type Budget interface {
-	// Allow returns nil if the team may send a request. Otherwise it returns
-	// an error wrapping meter.ErrNoBudget or meter.ErrOverBudget.
-	Allow(team string) error
-	// Record adds the tokens a finished request used.
-	Record(team string, tokens int64)
+// Identifier finds the agent that owns a virtual key.
+// *agents.Registry implements it. Implementations must be safe for concurrent use.
+type Identifier interface {
+	Lookup(key string) (agents.Agent, bool)
 }
 
-// Proxy sits between an agent and an LLM provider. It checks the team's budget,
-// forwards the request unchanged, and counts the tokens in the response.
+// Budget decides whether an agent may send a request and records what it
+// spent. *meter.Meter implements it. Implementations must be safe for
+// concurrent use.
+type Budget interface {
+	// Allow returns nil if the agent may send a request. Otherwise it returns
+	// an error wrapping meter.ErrOverBudget, meter.ErrUnknownAgent or
+	// meter.ErrNoBudget.
+	Allow(agent string) error
+	// Record adds the tokens a finished request used to the agent and its team.
+	Record(agent string, tokens int64)
+}
+
+// Options configures a Proxy. With Agents and Budget nil, the proxy runs in
+// watch-only mode: no keys are checked, the agent's Authorization header is
+// passed through, and nothing is blocked — usage is only logged.
+type Options struct {
+	Logger *slog.Logger
+	Agents Identifier // who is calling (from the virtual key)
+	Budget Budget     // may they spend more
+	// UpstreamKey is sent to the provider as "Authorization: Bearer <key>"
+	// in place of the agent's virtual key. Empty = send no Authorization
+	// (fine for local providers like Ollama).
+	UpstreamKey string
+}
+
+// Proxy sits between an agent and an LLM provider. It finds out which agent is
+// calling, checks the budgets, forwards the request, and counts the tokens in
+// the response.
 type Proxy struct {
-	rp     *httputil.ReverseProxy
-	logger *slog.Logger
-	budget Budget // nil = watch-only: count and log, never block
+	rp          *httputil.ReverseProxy
+	logger      *slog.Logger
+	agents      Identifier
+	budget      Budget
+	upstreamKey string
 }
 
 // New returns a Proxy that sends all requests to upstream
 // (for example http://localhost:11434 or https://api.openai.com).
-// If budget is nil, the proxy only logs usage and never blocks.
-func New(upstream *url.URL, logger *slog.Logger, budget Budget) *Proxy {
-	p := &Proxy{logger: logger, budget: budget}
+// Agents and Budget must both be set, or both be nil (watch-only mode).
+func New(upstream *url.URL, opts Options) (*Proxy, error) {
+	if (opts.Agents == nil) != (opts.Budget == nil) {
+		return nil, errors.New("proxy: Agents and Budget must both be set or both be nil")
+	}
+	if opts.Logger == nil {
+		opts.Logger = slog.New(slog.DiscardHandler)
+	}
+	p := &Proxy{logger: opts.Logger, agents: opts.Agents, budget: opts.Budget, upstreamKey: opts.UpstreamKey}
 	p.rp = &httputil.ReverseProxy{
 		Rewrite: func(r *httputil.ProxyRequest) {
 			// Point the request at the provider: scheme, host and path prefix.
@@ -63,18 +88,25 @@ func New(upstream *url.URL, logger *slog.Logger, budget Budget) *Proxy {
 			// provider for gzip itself and unzips it for us, so we always get
 			// plain JSON to read tokens from.
 			r.Out.Header.Del("Accept-Encoding")
-			// The team is our business, not the provider's.
-			r.Out.Header.Del(TeamHeader)
+			// Swap the agent's virtual key for the real provider key. The
+			// agent never sees the real key; the provider never sees ours.
+			if p.agents != nil {
+				r.Out.Header.Del("Authorization")
+				if p.upstreamKey != "" {
+					r.Out.Header.Set("Authorization", "Bearer "+p.upstreamKey)
+				}
+			}
 		},
 		ModifyResponse: p.recordUsage,
 		ErrorHandler:   p.handleError,
 	}
-	return p
+	return p, nil
 }
 
 // requestInfo travels with each request in its context, from ServeHTTP to
 // recordUsage.
 type requestInfo struct {
+	agent  string // "" in watch-only mode
 	team   string
 	start  time.Time
 	stream bool
@@ -82,17 +114,24 @@ type requestInfo struct {
 
 type requestInfoKey struct{}
 
-// ServeHTTP implements http.Handler. It is the "gate": budget check first,
-// then forward.
+// ServeHTTP implements http.Handler. It is the "gate": who are you, may you
+// spend more — and only then forward.
 func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
-	team := r.Header.Get(TeamHeader)
-	if team == "" {
-		team = DefaultTeam
-	}
+	var info requestInfo
 
-	if p.budget != nil {
-		if err := p.budget.Allow(team); err != nil {
-			p.reject(w, r, team, err)
+	if p.agents != nil {
+		agent, ok := p.agents.Lookup(bearerToken(r.Header.Get("Authorization")))
+		if !ok {
+			// Never log the key itself — not even a wrong one.
+			p.logger.WarnContext(r.Context(), "request rejected: missing or unknown virtual key",
+				slog.String("path", r.URL.Path))
+			writeError(w, http.StatusUnauthorized, "invalid_api_key", "missing or unknown virtual key")
+			return
+		}
+		info.agent, info.team = agent.Name, agent.Team
+
+		if err := p.budget.Allow(agent.Name); err != nil {
+			p.reject(w, r, info, err)
 			return
 		}
 	}
@@ -102,7 +141,7 @@ func (p *Proxy) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	info := requestInfo{team: team, start: time.Now(), stream: stream}
+	info.start, info.stream = time.Now(), stream
 	ctx := context.WithValue(r.Context(), requestInfoKey{}, info)
 	p.rp.ServeHTTP(w, r.WithContext(ctx))
 }
@@ -146,16 +185,26 @@ func writeError(w http.ResponseWriter, status int, code, message string) {
 	})
 }
 
-// reject answers without contacting the provider: 429 if the team used up its
-// budget, 403 if it has none. The body uses the OpenAI error shape so agent
-// SDKs can show the message.
-func (p *Proxy) reject(w http.ResponseWriter, r *http.Request, team string, err error) {
+// bearerToken returns the token from an "Authorization: Bearer <token>" header.
+func bearerToken(header string) string {
+	scheme, token, ok := strings.Cut(header, " ")
+	if !ok || !strings.EqualFold(scheme, "Bearer") {
+		return ""
+	}
+	return strings.TrimSpace(token)
+}
+
+// reject answers without contacting the provider: 429 if the agent or its team
+// used up its budget, 403 otherwise. The body uses the OpenAI error shape so
+// agent SDKs can show the message.
+func (p *Proxy) reject(w http.ResponseWriter, r *http.Request, info requestInfo, err error) {
 	status, code := http.StatusForbidden, "no_budget"
 	if errors.Is(err, meter.ErrOverBudget) {
 		status, code = http.StatusTooManyRequests, "budget_exceeded"
 	}
 	p.logger.WarnContext(r.Context(), "request blocked",
-		slog.String("team", team), slog.Int("status", status), slog.String("reason", err.Error()))
+		slog.String("agent", info.agent), slog.String("team", info.team),
+		slog.Int("status", status), slog.String("reason", err.Error()))
 	writeError(w, status, code, err.Error())
 }
 
@@ -169,8 +218,10 @@ func (p *Proxy) recordUsage(resp *http.Response) error {
 		slog.String("method", resp.Request.Method),
 		slog.String("path", resp.Request.URL.Path),
 		slog.Int("status", resp.StatusCode),
-		slog.String("team", info.team),
 		slog.Bool("stream", info.stream),
+	}
+	if info.agent != "" {
+		attrs = append(attrs, slog.String("agent", info.agent), slog.String("team", info.team))
 	}
 
 	// Streaming answers (Server-Sent Events) arrive in many small pieces.
@@ -220,8 +271,8 @@ func (p *Proxy) recordUsage(resp *http.Response) error {
 
 // account charges the tokens to the team and writes the "llm request" log line.
 func (p *Proxy) account(ctx context.Context, info requestInfo, u Usage, attrs []any) {
-	if p.budget != nil {
-		p.budget.Record(info.team, int64(u.InputTokens)+int64(u.OutputTokens))
+	if p.budget != nil && info.agent != "" {
+		p.budget.Record(info.agent, int64(u.InputTokens)+int64(u.OutputTokens))
 	}
 	attrs = append(attrs,
 		slog.String("model", u.Model),

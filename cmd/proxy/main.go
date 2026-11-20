@@ -1,13 +1,21 @@
-// Command proxy runs the agent-budget proxy: it forwards LLM requests from
-// agents to a provider and logs how many tokens each request used.
+// Command proxy runs the agent-budget proxy: it finds out which agent sends
+// each LLM request, enforces the agent's and its team's token budgets, and
+// forwards the request to the provider.
+//
+// Usage:
+//
+//	proxy          run the proxy
+//	proxy keygen   print a new virtual key and the hash to put in the agents file
 //
 // Configuration (environment variables):
 //
-//	LISTEN_ADDR   address to listen on        (default ":8080")
-//	UPSTREAM_URL  LLM provider base URL       (default "http://localhost:11434", Ollama)
-//	LOG_FORMAT    "text" or "json"            (default "text")
-//	BUDGETS       token limit per team, e.g. "default=1000,team-a=500"
-//	              (empty = watch-only: count and log, never block)
+//	LISTEN_ADDR       address to listen on   (default ":8080")
+//	UPSTREAM_URL      LLM provider base URL  (default "http://localhost:11434", Ollama)
+//	UPSTREAM_API_KEY  real provider key, sent instead of the agent's virtual key
+//	                  (empty = no Authorization sent, fine for Ollama / fakellm)
+//	AGENTS_FILE       JSON file with teams, agents and key hashes
+//	                  (empty = watch-only: no keys checked, nothing blocked)
+//	LOG_FORMAT        "text" or "json"       (default "text")
 package main
 
 import (
@@ -24,15 +32,29 @@ import (
 	"syscall"
 	"time"
 
+	"github.com/chikolavosaki-sys/agent-budget/internal/agents"
 	"github.com/chikolavosaki-sys/agent-budget/internal/meter"
 	"github.com/chikolavosaki-sys/agent-budget/internal/proxy"
 )
 
 func main() {
+	if len(os.Args) > 1 && os.Args[1] == "keygen" {
+		keygen(os.Stdout)
+		return
+	}
 	if err := run(); err != nil {
 		fmt.Fprintln(os.Stderr, "error:", err)
 		os.Exit(1)
 	}
+}
+
+// keygen prints a fresh virtual key and its hash.
+func keygen(w io.Writer) {
+	key := agents.NewKey()
+	_, _ = fmt.Fprintf(w, "key:        %s\n", key)
+	_, _ = fmt.Fprintf(w, "key_sha256: %s\n\n", agents.HashKey(key))
+	_, _ = fmt.Fprintln(w, "Give the key to the agent (it is shown only this once).")
+	_, _ = fmt.Fprintln(w, "Put key_sha256 in the agents file.")
 }
 
 func run() error {
@@ -44,30 +66,40 @@ func run() error {
 		return err
 	}
 
-	limits, err := meter.ParseBudgets(os.Getenv("BUDGETS"))
-	if err != nil {
-		return fmt.Errorf("parse BUDGETS: %w", err)
-	}
-
 	mux := http.NewServeMux()
 	mux.HandleFunc("GET /healthz", func(w http.ResponseWriter, _ *http.Request) {
 		_, _ = io.WriteString(w, "ok\n")
 	})
 
-	if len(limits) == 0 {
-		logger.Warn("BUDGETS is empty: watch-only mode, no request will be blocked")
+	opts := proxy.Options{Logger: logger, UpstreamKey: os.Getenv("UPSTREAM_API_KEY")}
+	if path := os.Getenv("AGENTS_FILE"); path == "" {
+		logger.Warn("AGENTS_FILE is empty: watch-only mode, no keys checked, no request blocked")
 		mux.HandleFunc("GET /budgets", func(w http.ResponseWriter, _ *http.Request) {
 			w.Header().Set("Content-Type", "application/json")
 			w.WriteHeader(http.StatusNotFound)
-			_, _ = io.WriteString(w, `{"error":{"message":"watch-only mode: BUDGETS is empty"}}`+"\n")
+			_, _ = io.WriteString(w, `{"error":{"message":"watch-only mode: AGENTS_FILE is empty"}}`+"\n")
 		})
-		mux.Handle("/", proxy.New(upstream, logger, nil))
 	} else {
-		m := meter.New(limits)
-		logger.Info("budgets loaded", "teams", len(limits))
+		registry, err := agents.Load(path)
+		if err != nil {
+			return err
+		}
+		m, err := meter.New(meterConfig(registry))
+		if err != nil {
+			return fmt.Errorf("build meter: %w", err)
+		}
+		opts.Agents, opts.Budget = registry, m
 		mux.Handle("GET /budgets", budgetsHandler(m))
-		mux.Handle("/", proxy.New(upstream, logger, m))
+		logger.Info("agents loaded",
+			"teams", len(registry.Teams()), "agents", len(registry.Agents()),
+			"upstream_key_set", opts.UpstreamKey != "")
 	}
+
+	p, err := proxy.New(upstream, opts)
+	if err != nil {
+		return err
+	}
+	mux.Handle("/", p)
 
 	srv := &http.Server{
 		Addr:              listenAddr,
@@ -105,7 +137,22 @@ func run() error {
 	return nil
 }
 
-// budgetsHandler shows every team's live usage as JSON.
+// meterConfig turns the agents file into the limits the meter needs.
+func meterConfig(r *agents.Registry) meter.Config {
+	cfg := meter.Config{
+		Teams:  make(map[string]int64),
+		Agents: make(map[string]meter.AgentBudget),
+	}
+	for _, t := range r.Teams() {
+		cfg.Teams[t.Name] = t.Budget
+	}
+	for _, a := range r.Agents() {
+		cfg.Agents[a.Name] = meter.AgentBudget{Team: a.Team, Limit: a.Budget}
+	}
+	return cfg
+}
+
+// budgetsHandler shows every team's and agent's live usage as JSON.
 func budgetsHandler(m *meter.Meter) http.Handler {
 	return http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
 		w.Header().Set("Content-Type", "application/json")

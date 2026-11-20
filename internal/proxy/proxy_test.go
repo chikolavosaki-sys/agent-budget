@@ -10,6 +10,8 @@ import (
 	"net/url"
 	"strings"
 	"testing"
+
+	"github.com/chikolavosaki-sys/agent-budget/internal/agents"
 )
 
 const (
@@ -24,11 +26,12 @@ const (
 // It returns the proxy's URL and a buffer that collects the proxy's logs.
 func newTestProxy(t *testing.T, provider http.HandlerFunc) (string, *bytes.Buffer) {
 	t.Helper()
-	return newTestProxyWithBudget(t, provider, nil)
+	return newTestProxyWithOptions(t, provider, Options{})
 }
 
-// newTestProxyWithBudget is newTestProxy with a budget gate (nil = watch-only).
-func newTestProxyWithBudget(t *testing.T, provider http.HandlerFunc, budget Budget) (string, *bytes.Buffer) {
+// newTestProxyWithOptions is newTestProxy with options (keys, budgets). The
+// logger in opts is replaced by one that writes into the returned buffer.
+func newTestProxyWithOptions(t *testing.T, provider http.HandlerFunc, opts Options) (string, *bytes.Buffer) {
 	t.Helper()
 	upstream := httptest.NewServer(provider)
 	t.Cleanup(upstream.Close)
@@ -38,11 +41,19 @@ func newTestProxyWithBudget(t *testing.T, provider http.HandlerFunc, budget Budg
 		t.Fatal(err)
 	}
 	logs := &bytes.Buffer{}
-	logger := slog.New(slog.NewJSONHandler(logs, nil))
+	opts.Logger = slog.New(slog.NewJSONHandler(logs, nil))
+	return startProxy(t, u, opts), logs
+}
 
-	front := httptest.NewServer(New(u, logger, budget))
+func startProxy(t *testing.T, upstream *url.URL, opts Options) string {
+	t.Helper()
+	p, err := New(upstream, opts)
+	if err != nil {
+		t.Fatal(err)
+	}
+	front := httptest.NewServer(p)
 	t.Cleanup(front.Close)
-	return front.URL, logs
+	return front.URL
 }
 
 // postChat sends one chat request through the proxy like an agent would, and
@@ -156,6 +167,13 @@ func TestProxyStreamingIsPassedThrough(t *testing.T) {
 	}
 }
 
+func TestNewRejectsHalfConfiguredOptions(t *testing.T) {
+	u, _ := url.Parse("http://localhost:1")
+	if _, err := New(u, Options{Agents: &agents.Registry{}}); err == nil {
+		t.Error("Agents without Budget should be an error")
+	}
+}
+
 func TestProxyUpstreamDown(t *testing.T) {
 	// Point the proxy at a server that is already closed.
 	dead := httptest.NewServer(http.NotFoundHandler())
@@ -163,10 +181,9 @@ func TestProxyUpstreamDown(t *testing.T) {
 	dead.Close()
 
 	logs := &bytes.Buffer{}
-	front := httptest.NewServer(New(u, slog.New(slog.NewJSONHandler(logs, nil)), nil))
-	t.Cleanup(front.Close)
+	frontURL := startProxy(t, u, Options{Logger: slog.New(slog.NewJSONHandler(logs, nil))})
 
-	status, _ := postChat(t, front.URL, nil)
+	status, _ := postChat(t, frontURL, nil)
 	if status != http.StatusBadGateway {
 		t.Fatalf("status = %d, want 502", status)
 	}
@@ -176,7 +193,7 @@ func TestProxyUpstreamDown(t *testing.T) {
 // assertNoSecrets fails if prompts, answers or API keys leaked into the logs.
 func assertNoSecrets(t *testing.T, log string) {
 	t.Helper()
-	for _, secret := range []string{testPrompt, testAPIKey, "SECRET_ANSWER_TEXT"} {
+	for _, secret := range []string{testPrompt, testAPIKey, "SECRET_ANSWER_TEXT", keyBot, keyHelper, keyOther, upstreamKey} {
 		if strings.Contains(log, secret) {
 			t.Errorf("log leaked %q", secret)
 		}

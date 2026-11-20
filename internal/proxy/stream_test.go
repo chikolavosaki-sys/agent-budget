@@ -11,8 +11,6 @@ import (
 	"testing"
 	"testing/iotest"
 	"time"
-
-	"github.com/chikolavosaki-sys/agent-budget/internal/meter"
 )
 
 func TestPrepareRequest(t *testing.T) {
@@ -256,15 +254,15 @@ const streamRequest = `{"model":"fake-model","stream":true,"messages":[{"role":"
 
 func TestProxyStreamingIsLiveAndCounted(t *testing.T) {
 	firstChunkSeen := make(chan struct{})
-	m := meter.New(map[string]int64{DefaultTeam: 1000})
-	proxyURL, logs := newTestProxyWithBudget(t, streamingProvider(t, firstChunkSeen), m)
+	opts, m := budgetSetup(t)
+	proxyURL, logs := newTestProxyWithOptions(t, streamingProvider(t, firstChunkSeen), opts)
 
 	req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
 		proxyURL+"/v1/chat/completions", strings.NewReader(streamRequest))
 	if err != nil {
 		t.Fatal(err)
 	}
-	req.Header.Set("Authorization", "Bearer "+testAPIKey)
+	req.Header.Set("Authorization", "Bearer "+keyOther)
 	resp, err := http.DefaultClient.Do(req)
 	if err != nil {
 		t.Fatal(err)
@@ -285,7 +283,7 @@ func TestProxyStreamingIsLiveAndCounted(t *testing.T) {
 	if first+string(rest) != sseStream("\n", true) {
 		t.Errorf("agent got a changed stream:\n%s%s", first, rest)
 	}
-	if got := usedBy(m, DefaultTeam); got != tokensPerCall {
+	if got := agentUsed(m, "other"); got != tokensPerCall {
 		t.Errorf("used = %d, want %d", got, tokensPerCall)
 	}
 	log := logs.String()
@@ -297,11 +295,11 @@ func TestProxyStreamingIsLiveAndCounted(t *testing.T) {
 	assertNoSecrets(t, log)
 }
 
-// TestProxyStreamingCannotBypassBudget is the bug IDEA-1 fixes: before, a
-// team could stream forever without being charged.
+// TestProxyStreamingCannotBypassBudget is the bug IDEA-1 fixes: before, an
+// agent could stream forever without being charged. "bot" has 50 tokens.
 func TestProxyStreamingCannotBypassBudget(t *testing.T) {
-	m := meter.New(map[string]int64{DefaultTeam: 50})
-	proxyURL, _ := newTestProxyWithBudget(t, streamingProvider(t, nil), m)
+	opts, _ := budgetSetup(t)
+	proxyURL, _ := newTestProxyWithOptions(t, streamingProvider(t, nil), opts)
 
 	stream := func() int {
 		req, err := http.NewRequestWithContext(t.Context(), http.MethodPost,
@@ -309,6 +307,7 @@ func TestProxyStreamingCannotBypassBudget(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
+		req.Header.Set("Authorization", "Bearer "+keyBot)
 		resp, err := http.DefaultClient.Do(req)
 		if err != nil {
 			t.Fatal(err)

@@ -2,14 +2,14 @@
 
 ## The big picture
 
-agent-budget will grow into four parts. Today the **proxy** and a simple in-memory **meter** exist (M0 + M1).
+agent-budget will grow into four parts. Today the **proxy**, an in-memory **meter** and an **agent registry** exist (M0 – M2).
 
 ```mermaid
 flowchart TB
     subgraph K8s["Kubernetes cluster (later milestones)"]
         Agents["🤖 AI agents<br/>(kagent)"]
-        Proxy["🛡️ Proxy — enforce<br/>M0 ✅ forward + log<br/>M1 ✅ block with 429"]
-        Meter["🧮 Meter — account<br/>M1 ✅ in-memory counters<br/>M5 ⬜ durable"]
+        Proxy["🛡️ Proxy — enforce<br/>M0 ✅ forward + log<br/>M1 ✅ block with 429<br/>M2 ✅ virtual key → agent"]
+        Meter["🧮 Meter — account<br/>M2 ✅ per agent + per team<br/>M5 ⬜ durable"]
         Ctrl["⚙️ Controller — configure<br/>M3 ⬜ TokenBudget CRD"]
         Tel["📈 Telemetry — explain<br/>M4 ⬜ OTel → Jaeger / Prometheus"]
     end
@@ -46,34 +46,58 @@ The operating system delivers it over a **TCP connection** to the process listen
 The server's router (`http.ServeMux`) looks at the path:
 
 - `GET /healthz` → answer `ok` (used by Kubernetes to check the proxy is alive)
-- `GET /budgets` → live usage per team as JSON
+- `GET /budgets` → live usage per team and per agent as JSON
 - everything else → `proxy.ServeHTTP`
 
-### 3. The budget gate (M1)
+### 3. Who is calling? (M2)
 
-`ServeHTTP` (`internal/proxy/proxy.go`) reads the `X-Budget-Team` header (missing → `default`) and asks the meter:
+The agent sends its **virtual key**: `Authorization: Bearer ab-demo-invoice-bot`.
+
+`ServeHTTP` (`internal/proxy/proxy.go`) takes the token out of the header and asks the registry (`internal/agents`):
 
 ```go
-if err := p.budget.Allow(team); err != nil {
-    p.reject(w, r, team, err) // 429 or 403 — the LLM is never called
+agent, ok := p.agents.Lookup(bearerToken(r.Header.Get("Authorization")))
+if !ok {
+    writeError(w, 401, "invalid_api_key", "missing or unknown virtual key")
     return
 }
 ```
 
+`Lookup` does **not** compare keys. It computes `sha256(key)` and looks the hash up in a map built at start from the agents file:
+
+```mermaid
+flowchart LR
+    K["ab-demo-invoice-bot"] -- "sha256" --> H["0349141c…"]
+    H -- "map lookup" --> A["invoice-bot<br/>team payments<br/>owner payments-lead<br/>budget 50"]
+```
+
+The agents file holds only hashes, so reading it does not reveal any key. And because the agent is found **from the key**, an agent cannot claim to be someone else or charge another team — the problem the M1 `X-Budget-Team` header had.
+
+### 3b. May they spend more?
+
+```go
+if err := p.budget.Allow(agent.Name); err != nil {
+    p.reject(w, r, info, err) // 429 — the LLM is never called
+    return
+}
+```
+
+The meter checks **two** budgets — like pocket money and the family's monthly budget: if either is empty, no more spending.
+
 ```mermaid
 flowchart TD
-    Q["Allow(team)"] --> K{"team in BUDGETS?"}
-    K -- no --> F["403 no_budget<br/>(fail closed)"]
-    K -- yes --> U{"used ≥ limit?"}
-    U -- yes --> T["429 budget_exceeded"]
-    U -- no --> G["✅ forward to the LLM"]
+    Q["Allow(agent)"] --> K{"agent known?"}
+    K -- no --> F["refuse<br/>(fail closed)"]
+    K -- yes --> A{"agent has own budget<br/>and used ≥ it?"}
+    A -- yes --> T1["429 — message names the agent"]
+    A -- no --> T{"team used ≥ team budget?"}
+    T -- yes --> T2["429 — message names the team"]
+    T -- no --> G["✅ forward to the LLM"]
 ```
 
 Blocking here, **before** forwarding, is the whole point: a blocked request costs zero tokens.
 
-### 3b. Stamp team and start time
-
-`ServeHTTP` then puts a small `requestInfo{team, start}` into the request's **context** — a bag of values that travels with the request — so the response side knows which team to charge and how long the LLM took.
+The proxy then puts a small `requestInfo{agent, team, start, stream}` into the request's **context** — a bag of values that travels with the request — so the response side knows whom to charge and how long the LLM took.
 
 ### 3c. Prepare the body
 
@@ -88,9 +112,13 @@ Go's standard library `httputil.ReverseProxy` does the forwarding. Our `Rewrite`
 
 1. `SetURL(upstream)` — changes scheme + host to the provider (e.g. `http://localhost:9090`), keeps the path `/v1/chat/completions`.
 2. Deletes `Accept-Encoding` — so Go's HTTP client asks for gzip *itself* and unzips it for us. Otherwise the body could arrive compressed and we couldn't read the tokens.
-3. Deletes `X-Budget-Team` — the team is our business, not the provider's.
+3. **Swaps the key**: deletes the agent's `Authorization` (the virtual key) and, if `UPSTREAM_API_KEY` is set, adds `Authorization: Bearer <UPSTREAM_API_KEY>`.
 
-Headers (including `Authorization`) and body go through unchanged.
+The agent never sees the real provider key, and the provider never sees our virtual keys. If one agent's key leaks, you remove that one agent from the file — the provider key stays safe.
+
+*Analogy:* every hostel student has their own ID card; only the warden holds the master key.
+
+All other headers and the body go through unchanged. (In watch-only mode, without `AGENTS_FILE`, the agent's own `Authorization` is passed through.)
 
 ### 5. The provider answers
 
@@ -175,13 +203,13 @@ The proxy writes the identical status, headers and body back on the agent's TCP 
 
 ### 8. Memory, not a database
 
-The meter keeps two Go maps in RAM: `limits[team]` and `used[team]`. Nothing is written to disk, so **restarting the proxy resets every counter**. A database (Redis or Postgres) arrives in M5.
+The meter keeps Go maps in RAM: limits and used tokens per team and per agent. Nothing is written to disk, so **restarting the proxy resets every counter**. A database (Redis or Postgres) arrives in M5.
 
 ---
 
 ## The meter and the mutex
 
-Go's `net/http` runs every request in its own goroutine. With 20 agents calling at once, 20 goroutines may run `used[team] += tokens` **at the same moment**.
+Go's `net/http` runs every request in its own goroutine. With 20 agents calling at once, 20 goroutines may run `teamUsed[team] += tokens` **at the same moment**.
 
 `+=` is really three steps: *read* the old value, *add*, *write* it back. If two goroutines interleave:
 
@@ -197,12 +225,16 @@ B's tokens are **lost** — a *lost update*. With Go maps it is even worse: the 
 The fix is a **mutex** (`sync.Mutex`) — a lock that only one goroutine can hold at a time:
 
 ```go
-func (m *Meter) Record(team string, tokens int64) {
+func (m *Meter) Record(agent string, tokens int64) {
     m.mu.Lock()
     defer m.mu.Unlock()
-    m.used[team] += tokens
+    team := m.agentTeam[agent]
+    m.agentUsed[agent] += tokens
+    m.teamUsed[team] += tokens
 }
 ```
+
+Both counters change under **one** lock, so nobody can ever see the agent's tokens added but the team's not yet.
 
 Every method that touches the maps (`Allow`, `Record`, `Snapshot`) takes the same lock.
 
@@ -219,7 +251,7 @@ limit 50 │ request 1: used 0  → allowed → +22 → used 22
          │ request 4: used 66 → 429
 ```
 
-Also, if 10 requests from one team arrive at the same time, all 10 may pass the gate before any of them records tokens. So the overshoot is at most *(requests in flight) × (tokens per request)*.
+Also, if 10 requests from one agent arrive at the same time, all 10 may pass the gate before any of them records tokens. So the overshoot is at most *(requests in flight) × (tokens per request)*.
 
 This is the classic **check-then-act** problem. It is accepted for now (D-005). A fix — *reserve* tokens before the call using the request's `max_tokens`, then settle the real amount after — is [IDEA-2](../research/IDEAS.md).
 
@@ -236,8 +268,9 @@ This is the classic **check-then-act** problem. It is accepted for now (D-005). 
 | Stream breaks before the usage chunk | whatever arrived | `WARN stream ended without usage` |
 | Request body > 32 MiB | `413` | — |
 | `stream_options` is not an object | `400` | — |
-| Team over budget | `429` `budget_exceeded` | `WARN request blocked` |
-| Team has no budget | `403` `no_budget` | `WARN request blocked` |
+| Missing or unknown virtual key | `401` `invalid_api_key` | `WARN request rejected` (key not logged) |
+| Agent or team over budget | `429` `budget_exceeded` | `WARN request blocked` |
+| Agents file is broken | proxy does not start | every problem listed at once |
 
 ## Shutdown
 
@@ -266,13 +299,16 @@ flowchart LR
 | `TestUsageStreamReader` (table) | one-byte reads, CRLF, no usage, 1 MiB+ line, no trailing newline; `onDone` exactly once |
 | `TestProxyUpstreamDown` | 502 returned, no secrets logged |
 | `TestParseUsage` (table) | normal, zero tokens, missing usage, broken JSON, empty body |
-| `TestBudgetBlocksWhenOver` | 200, 200, then 429; the blocked call never reaches the provider |
-| `TestBudgetUnknownTeamFailsClosed` | unknown team → 403, provider never called |
-| `TestBudgetCountsPerTeamAndHidesHeader` | tokens charged to the right team; header not forwarded |
+| `TestVirtualKeyRequired` (table) | no key, wrong key, provider key, the hash itself, `Basic` auth → all 401, provider never called, nothing leaked to logs |
+| `TestVirtualKeySwappedForUpstreamKey` (table) | provider sees `UPSTREAM_API_KEY` (or nothing), never the virtual key |
+| `TestAgentBudgetBlocks` | agent's own budget: 200, 200, then 429; agent and team both charged |
+| `TestTeamBudgetSharedByAgents` | two agents use up their team; a third agent in another team still works |
 | `TestBudgetNotChargedOnUpstreamError` | a failed call costs nothing |
-| `TestConcurrentRequestsCountedExactly` | 20 agents × 10 requests through the real proxy, exact total |
-| `TestAllow`, `TestSnapshot`, `TestParseBudgets` (tables) | meter rules and `BUDGETS` parsing |
+| `TestConcurrentRequestsCountedExactly` | 20 workers × 10 requests through the real proxy, exact agent and team totals |
+| `TestAllow`, `TestSnapshot` (tables) | meter rules: own limit, team limit, unknown agent |
 | `TestConcurrentRecord` | 100 goroutines × 1000 updates, no lost updates |
+| `TestParse` (table), `TestLookup` | agents file validation (typos, missing owner, shared keys…) and key → agent |
+| `TestExampleFileIsValid` | `examples/agents.json` loads and the demo keys in the docs really work |
 
 All tests run with Go's **race detector** (`go test -race`).
 

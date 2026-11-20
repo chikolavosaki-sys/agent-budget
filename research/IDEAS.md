@@ -56,3 +56,23 @@ Verify each one's current status before relying on it. Remove an entry once it h
 - Already solved elsewhere?: partly — payment systems and some rate limiters; not per agent for LLM tokens.
 - Concept learned: check-then-act, reservations, two-phase accounting
 - Status: new
+
+## IDEA-3: Reload the agents file without a restart
+- Inspired by: D-007 trade-off; Kubernetes controllers react to changes instead of restarting.
+- The idea in one line: watch `AGENTS_FILE`; on change, validate the new file and swap the registry and limits atomically, keeping the counters.
+- How it works there (plain words + analogy): like a restaurant changing the menu board during service — customers already eating are not thrown out.
+- How it would work here: re-read on SIGHUP or file change; build a new Registry; if valid, swap it behind an `atomic.Pointer`; the meter keeps `used` and takes new limits under its mutex. In M3 the CRD controller does the same from Kubernetes.
+- Impact / Effort / Learning (1–5 each): 4 / 2 / 4
+- Already solved elsewhere?: yes — common pattern (nginx reload, Kubernetes ConfigMap reload); we need it for our own state.
+- Concept learned: atomic pointer swap, copy-on-write, graceful config reload
+- Status: new — probably folded into M3
+
+## IDEA-4: Identify agents by Kubernetes service account
+- Inspired by: Kubernetes ServiceAccount tokens and the TokenReview API (verify docs before building).
+- The idea in one line: an agent pod sends its projected service-account token; the proxy verifies it with Kubernetes and gets namespace + service account = agent identity, with no keys to hand out.
+- How it works there (plain words + analogy): Kubernetes gives every pod an ID card it signs itself; anyone can ask Kubernetes "is this card real?".
+- How it would work here: a second `Identifier` implementation next to virtual keys; cache verified tokens so the hot path makes no network call per request.
+- Impact / Effort / Learning (1–5 each): 5 / 4 / 5
+- Already solved elsewhere?: partly — service meshes use pod identity; not tied to token budgets.
+- Concept learned: workload identity, JWT, caching on the hot path
+- Status: new — candidate for M6 (kagent)

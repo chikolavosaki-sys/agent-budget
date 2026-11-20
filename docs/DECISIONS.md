@@ -13,6 +13,13 @@ Format:
 - Status: accepted | superseded by D-<n>
 ```
 
+## D-007: M2 identity — a virtual key per agent, agents file with key hashes (2026-11-20)
+- Context: with M1's `X-Budget-Team` header any agent could claim any team. M2 must know *which agent* calls, its team and its owner, and enforce per-agent budgets.
+- Options considered: trusted header (`X-Agent-Id`) / virtual key per agent / Kubernetes service account token.
+- Decision: **virtual key per agent**. Agents send `Authorization: Bearer ab-…`; the proxy looks up `sha256(key)` in a JSON agents file (`AGENTS_FILE`) that lists teams (with budgets) and agents (team, required owner, optional own budget, `key_sha256`). Unknown key → `401 invalid_api_key`. The proxy replaces the virtual key with `UPSTREAM_API_KEY` before forwarding. A request is blocked (`429`) when the agent's own budget or its team's budget is used up. `X-Budget-Team` and `BUDGETS` are removed. Without `AGENTS_FILE` the proxy stays in watch-only mode.
+- Why: identity comes from a secret the agent holds, so it cannot be faked; the provider key never leaves the proxy; works with any OpenAI SDK (it is just an API key) and needs no cluster. Only hashes are stored, so the file is safe to commit or put in a ConfigMap; SHA-256 (not bcrypt) is enough because keys are 128+ random bits. Trade-offs we accept: changing the file needs a restart (IDEA-3); key rotation is manual; virtual keys are a feature LLM gateways also have — our difference is per-agent ownership and budgets, and later budgets as Kubernetes resources (M3) and service-account identity (IDEA-4). `GET /budgets` has no authentication (shows names and numbers only).
+- Status: accepted
+
 ## D-006: Count streaming responses by turning on include_usage (2026-11-19)
 - Context: with M1 enforcement, `"stream": true` requests were not counted, so a team could bypass its budget by streaming.
 - Options considered: block streaming when budgets are on / estimate tokens from the streamed text / ask the provider for usage with `stream_options.include_usage` and read the final chunk.
@@ -30,7 +37,7 @@ Format:
   - Storage: Go map + `sync.Mutex` / `sync.Map` / atomics per team. → **map + mutex**.
 - Decision: as marked above. Over budget → `429 budget_exceeded` in the OpenAI error shape.
 - Why: smallest design that blocks real overspending and is easy to reason about. Trade-offs we accept: overshoot up to (in-flight requests × tokens per request); any agent can claim any team; counters reset on restart; streaming requests are not counted (IDEA-1). Mutex chosen over `sync.Map` because `Allow` must read the limit and the usage together, consistently.
-- Status: accepted
+- Status: accepted; team identity via `X-Budget-Team` superseded by D-007
 
 ## D-004: Pin `go 1.26` in go.mod and require golangci-lint ≥ 2.15 (2026-11-19)
 - Context: the dev machine has Go 1.27.4; golangci-lint 2.10.1 panics on Go 1.27 standard-library export data.

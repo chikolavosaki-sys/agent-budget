@@ -35,6 +35,25 @@ Every term used in this project, in plain words with an everyday analogy. Useful
 
 **TCP connection / port** — TCP is the reliable "phone line" between two programs; a port (like `8080`) is the extension number that picks which program answers.
 
+## Identity and security
+
+**Authentication vs. authorization** — *Authentication* answers "who are you?" (we check the virtual key → `401` if unknown). *Authorization* answers "may you do this?" (we check the budget → `429` if used up).
+*Analogy:* at the cinema, the ticket checker first checks it's *your* ticket (authentication), then that it's for *this* show (authorization).
+
+**Virtual key** — A key our proxy gives to each agent, looking like a normal API key (`ab-…`). It only works against our proxy, and it tells the proxy exactly which agent is calling. The real provider key stays inside the proxy.
+*Analogy:* every hostel student has their own ID card; only the warden holds the master key. A lost ID card is cancelled alone — the locks don't need changing.
+
+**Bearer token** — The format `Authorization: Bearer <token>`: "whoever *bears* (carries) this token may enter". That is why a leaked token is dangerous, and why we never log it.
+
+**Hash (SHA-256)** — A function that turns any text into a fixed-length fingerprint (64 hex characters). Same input → same fingerprint; but you cannot get the input back from the fingerprint.
+*Analogy:* a fingerprint identifies a person, but you can't rebuild the person from it.
+
+**Why store only the hash?** — The agents file can then be committed to Git or put in a Kubernetes ConfigMap without leaking keys. To check a key, the proxy hashes it and compares fingerprints.
+
+**Why SHA-256 and not bcrypt?** — Human passwords are short and guessable ("password123"), so they need a deliberately *slow* hash like bcrypt to make guessing expensive. Our keys are 128+ random bits from `crypto/rand` — there is nothing to guess, so a fast hash is enough.
+
+**Owner** — Every agent must name a person or team responsible for it. When an agent overspends at 3 a.m., somebody must be reachable. The proxy refuses to start if an owner is missing.
+
 ## Go
 
 **Goroutine** — A lightweight thread managed by Go. Costs a few KB; you can run thousands.
@@ -68,10 +87,10 @@ Every term used in this project, in plain words with an everyday analogy. Useful
 
 **Structured logging (`slog`)** — Logs as key=value pairs instead of free text, so machines can search them (`input_tokens=11`).
 
-**Fail closed vs. fail open** — When the system is unsure, *fail closed* says "no", *fail open* says "yes". We fail closed: a team with no budget gets `403`.
+**Fail closed vs. fail open** — When the system is unsure, *fail closed* says "no", *fail open* says "yes". We fail closed: an unknown key gets `401`, and an agent the meter does not know is refused.
 *Analogy:* a door with an electronic lock — in a power cut, a bank vault stays locked (closed); a fire exit opens (open).
 
-**429 vs. 403** — `429 Too Many Requests`: "you're allowed, but you've used up your share — slow down". `403 Forbidden`: "you're not allowed at all".
+**401 vs. 403 vs. 429** — `401 Unauthorized`: "I don't know who you are" (no key or a wrong key). `403 Forbidden`: "I know you, but you may not do this". `429 Too Many Requests`: "you may, but you've used up your share".
 
 **Graceful shutdown** — On Ctrl+C, stop taking new work but finish current work before exiting.
 *Analogy:* the shop pulls down the shutter halfway — no new customers, but those inside finish shopping.

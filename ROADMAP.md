@@ -2,7 +2,7 @@
 
 ## Next
 
-- [ ] Start M2: decide how to identify the agent and team (header vs. virtual key vs. Kubernetes service account), record it in DECISIONS, add per-agent counters.
+- [ ] Start M3: `TokenBudget` CRD (`v1alpha1`) and a controller on kind, so changing the YAML changes the live limit. Set up kind and kubebuilder first.
 
 ## Milestones
 
@@ -10,7 +10,7 @@ Each milestone must work end to end, with tests, before the next one starts.
 
 - [x] **M0 — Hello proxy.** Go module, Makefile (`build`, `test`, `lint`), golangci-lint config. A proxy forwards one LLM request and logs `input_tokens` / `output_tokens` from the response. Unit test with a fake provider. *(done 2026-11-19 — also ships `fakellm` for demos and GitHub Actions CI)*
 - [x] **M1 — Count and block.** In-memory per-team counter; return HTTP 429 when over the limit. Concurrency test with `-race`. *(done 2026-11-19 — `X-Budget-Team` header, `BUDGETS` env, `GET /budgets`, 403 for teams without a budget; see D-005. Streaming counted too — IDEA-1, D-006)*
-- [ ] **M2 — Know the agent.** Identify agent + team per request (header, virtual key, or Kubernetes service account — decide and record in DECISIONS). Per-agent counters.
+- [x] **M2 — Know the agent.** Identify agent + team per request (header, virtual key, or Kubernetes service account — decide and record in DECISIONS). Per-agent counters. *(done 2026-11-20 — virtual key per agent, `AGENTS_FILE` with key hashes and required owners, per-agent + per-team budgets, `proxy keygen`; see D-007)*
 - [ ] **M3 — Budgets in Kubernetes.** `TokenBudget` CRD (`v1alpha1`) + controller on kind. Changing the YAML changes the live limit. envtest coverage.
 - [ ] **M4 — See it.** OTel GenAI traces into Jaeger, metrics into Prometheus, one Grafana dashboard: spend by team and by agent.
 - [ ] **M5 — Survive restarts and scale out.** Durable counters (Redis or Postgres — decide and record in DECISIONS); correct behaviour with two proxy replicas and concurrent requests.
